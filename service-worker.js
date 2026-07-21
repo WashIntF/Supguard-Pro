@@ -4,10 +4,10 @@ const CACHE_NAME = 'supguard-pro-' + SW_VERSION;
 
 const APP_SHELL = [
   './',
-  './clean_agent_inspection.html',
+  './index.html',
   './manifest.json',
-  './icon-192.png',
-  './icon-512.png'
+  './icon_192.png',
+  './icon_512.png'
 ];
 
 self.addEventListener('install', (event) => {
@@ -45,7 +45,7 @@ self.addEventListener('fetch', (event) => {
           caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
           return res;
         })
-        .catch(() => caches.match(req).then((cached) => cached || caches.match('./clean_agent_inspection.html')))
+        .catch(() => caches.match(req).then((cached) => cached || caches.match('./index.html')))
     );
     return;
   }
