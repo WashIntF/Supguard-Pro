@@ -378,8 +378,16 @@ td input,td select{padding:5px 6px;font-size:13px;}
   </div>
 
   <div class="card">
+    <h2>Google Drive</h2>
+    <p class="hint" id="driveStatus"><span class="badge orange">Loading…</span> Waiting on Google sign-in.</p>
+    <button class="btn block" id="btnDriveRetry">🔄 Retry Google Connection</button>
+    <p class="hint">Drive needs an internet connection. When offline, use 📤 Export to save a <code>.supguard</code> file to the device instead.</p>
+  </div>
+
+  <div class="card">
     <button class="btn primary block" id="btnSaveSettings">💾 Save Inspector &amp; Company Info</button>
     <p class="hint" id="settingsSavedNote">Changes save automatically as you type.</p>
+    <p class="hint" id="appVersion" style="text-align:center;margin-top:10px;"></p>
   </div>
 </section>
 
@@ -417,9 +425,10 @@ td input,td select{padding:5px 6px;font-size:13px;}
 'use strict';
 
 /* ---------------- Constants ---------------- */
+var APP_VERSION = '1.3.0';
 var SETTINGS_KEY = 'supguard_settings';
 var CLIENT_ID = '651583783394-b7u4l56ffh34ek9nul5u8s2gql4ut6mi.apps.googleusercontent.com';
-var API_KEY = 'AIzaSyAPsXZacoDo3Ru1EiXbNJ3p4Gw25v5JZ3o';
+// No API key needed: Drive REST calls authenticate with the OAuth bearer token.
 var DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 var DRIVE_FOLDER_NAME = 'SupGuard Pro';
 
@@ -520,12 +529,12 @@ function joinParts(parts, sep){
 function todayStr(){ var d=new Date(); return d.toISOString().slice(0,10); }
 
 var toastTimer=null;
-function toast(msg){
+function toast(msg, ms){
   var t = $('toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(function(){ t.classList.remove('show'); }, 2600);
+  toastTimer = setTimeout(function(){ t.classList.remove('show'); }, ms || 2600);
 }
 
 function openModal(id){ $(id).classList.add('open'); }
@@ -1060,125 +1069,240 @@ function importLocal(file){
   };
   reader.readAsText(file);
 }
-
-/* ---------------- Google Drive Integration ---------------- */
-var gapiInited = false, gisInited = false, tokenClient = null, accessToken = null, driveFolderId = null;
-
-window.gapiLoaded = function(){
-  gapi.load('client', function(){
-    gapi.client.init({ apiKey: API_KEY, discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/drive/v3/rest'] })
-      .then(function(){ gapiInited = true; })
-      .catch(function(e){ console.error('gapi init failed', e); });
-  });
-};
+/* ---------------- Google Drive Integration ----------------
+   Uses the Drive REST API directly with an OAuth bearer token from Google
+   Identity Services. The old version also loaded gapi + an API key and called
+   gapi.client.init() with a discovery document; if that init promise rejected
+   (restricted API key, blocked discovery fetch, flaky connection) the app got
+   permanently stuck reporting "Google API still loading" with no way to
+   recover and no visible reason. Drive REST needs only the bearer token, so
+   the API key and the whole gapi dependency are gone.
+   ---------------------------------------------------------- */
+var gisInited = false, gisFailed = null, tokenClient = null, accessToken = null, driveFolderId = null;
 
 window.gisLoaded = function(){
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID,
-    scope: DRIVE_SCOPE,
-    callback: '' // set per-request
-  });
-  gisInited = true;
+  try {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: DRIVE_SCOPE,
+      callback: function(){} // replaced per-request in getToken()
+    });
+    gisInited = true;
+    gisFailed = null; // a later success clears an earlier failure
+    updateDriveStatus();
+  } catch(e){
+    gisFailed = e.message || String(e);
+    console.error('GSI init failed', e);
+    updateDriveStatus();
+  }
 };
 
-function ensureAuth(cb){
-  if(!gapiInited || !gisInited){ toast('Google API still loading — try again in a moment'); return; }
-  tokenClient.callback = function(resp){
-    if(resp.error){ toast('Google sign-in failed'); return; }
-    accessToken = resp.access_token;
-    gapi.client.setToken({ access_token: accessToken });
-    cb();
-  };
-  if(accessToken){ cb(); }
-  else { tokenClient.requestAccessToken({ prompt:'select_account' }); }
+// The <script onerror> case: the file never arrived at all (offline, DNS,
+// blocker, restricted network). Without this the app waits forever.
+window.gisLoadFailed = function(){
+  gisFailed = 'the Google sign-in script could not be downloaded';
+  updateDriveStatus();
+};
+
+// Small status line on the Inspector tab so this is diagnosable in the field.
+function updateDriveStatus(){
+  var el = $('driveStatus');
+  if(!el) return;
+  if(gisFailed){
+    el.innerHTML = '<span class="badge red">Unavailable</span> ' + escapeHtml(gisFailed) +
+      '. Reports can still be saved with 📤 Export.';
+  } else if(gisInited){
+    el.innerHTML = accessToken
+      ? '<span class="badge green">Signed in</span> Drive save/load ready.'
+      : '<span class="badge green">Ready</span> You\'ll be asked to sign in on first save.';
+  } else {
+    el.innerHTML = '<span class="badge orange">Loading…</span> Waiting on Google sign-in.';
+  }
 }
+
+// Surfaced to the user instead of being swallowed into console.error.
+function driveError(msg){
+  console.error('Drive error:', msg);
+  toast('Drive: ' + msg, 7000);
+  var list = $('driveFileList');
+  if(list && $('driveModal').classList.contains('open')){
+    list.innerHTML = '<p class="hint" style="color:var(--danger)">' + escapeHtml(msg) + '</p>';
+  }
+}
+
+// The Google script is async; waiting beats telling the user to try again.
+function waitForGis(timeoutMs){
+  return new Promise(function(resolve, reject){
+    if(gisInited) return resolve();
+    if(gisFailed) return reject(new Error('Google sign-in failed to start: ' + gisFailed));
+    var waited = 0, step = 200;
+    var timer = setInterval(function(){
+      if(gisInited){ clearInterval(timer); resolve(); return; }
+      if(gisFailed){ clearInterval(timer); reject(new Error('Google sign-in failed to start: ' + gisFailed)); return; }
+      waited += step;
+      if(waited >= timeoutMs){
+        clearInterval(timer);
+        reject(new Error('Google sign-in library never loaded. Check your connection, or whether accounts.google.com is blocked on this network.'));
+      }
+    }, step);
+  });
+}
+
+function getToken(){
+  return waitForGis(20000).then(function(){
+    if(accessToken) return accessToken;
+    return new Promise(function(resolve, reject){
+      tokenClient.callback = function(resp){
+        if(resp && resp.error){
+          reject(new Error('Sign-in failed: ' + (resp.error_description || resp.error)));
+          return;
+        }
+        accessToken = resp.access_token;
+        updateDriveStatus();
+        resolve(accessToken);
+      };
+      tokenClient.error_callback = function(err){
+        var t = err && err.type ? err.type : 'unknown';
+        if(t === 'popup_closed') reject(new Error('Sign-in window was closed before finishing.'));
+        else if(t === 'popup_failed_to_open') reject(new Error('Sign-in popup was blocked. Allow popups for this site and try again.'));
+        else reject(new Error('Sign-in was cancelled or blocked (' + t + ').'));
+      };
+      try { tokenClient.requestAccessToken({ prompt: 'select_account' }); }
+      catch(e){ reject(new Error('Could not start sign-in: ' + (e.message || e))); }
+    });
+  });
+}
+
+function readDriveError(res){
+  return res.text().then(function(txt){
+    var detail = txt;
+    try {
+      var j = JSON.parse(txt);
+      if(j.error && j.error.message) detail = j.error.message;
+    } catch(e){ /* non-JSON body; use raw text */ }
+    if(res.status === 403 && /origin|referer/i.test(detail)){
+      detail += ' — add this site to Authorized JavaScript origins in Google Cloud Console.';
+    }
+    return new Error('HTTP ' + res.status + ' — ' + detail.slice(0, 200));
+  });
+}
+
+function driveFetch(url, opts, isRetry){
+  opts = opts || {};
+  return getToken().then(function(tok){
+    var headers = {};
+    for(var k in (opts.headers || {})) headers[k] = opts.headers[k];
+    headers['Authorization'] = 'Bearer ' + tok;
+    return fetch(url, { method: opts.method || 'GET', headers: headers, body: opts.body });
+  }).then(function(res){
+    // Tokens expire after ~1h; drop it and re-auth once rather than failing.
+    if(res.status === 401 && !isRetry){
+      accessToken = null;
+      return driveFetch(url, opts, true);
+    }
+    if(!res.ok) return readDriveError(res).then(function(err){ throw err; });
+    return res;
+  }, function(networkErr){
+    if(networkErr instanceof Error && /HTTP |Sign-in|Google sign-in/.test(networkErr.message)) throw networkErr;
+    throw new Error('Network request failed — are you offline?');
+  });
+}
+
+var DRIVE_API = 'https://www.googleapis.com/drive/v3/files';
+var DRIVE_UPLOAD = 'https://www.googleapis.com/upload/drive/v3/files';
 
 function findOrCreateFolder(){
   if(driveFolderId) return Promise.resolve(driveFolderId);
-  var q = "mimeType='application/vnd.google-apps.folder' and name='"+DRIVE_FOLDER_NAME+"' and trashed=false";
-  return gapi.client.drive.files.list({ q: q, fields: 'files(id,name)' }).then(function(res){
-    if(res.result.files && res.result.files.length){ driveFolderId = res.result.files[0].id; return driveFolderId; }
-    return gapi.client.drive.files.create({ resource:{ name: DRIVE_FOLDER_NAME, mimeType:'application/vnd.google-apps.folder' }, fields:'id' })
-      .then(function(cr){ driveFolderId = cr.result.id; return driveFolderId; });
-  });
+  var q = "mimeType='application/vnd.google-apps.folder' and name='" + DRIVE_FOLDER_NAME + "' and trashed=false";
+  return driveFetch(DRIVE_API + '?q=' + encodeURIComponent(q) + '&fields=' + encodeURIComponent('files(id,name)') + '&spaces=drive')
+    .then(function(res){ return res.json(); })
+    .then(function(j){
+      if(j.files && j.files.length){ driveFolderId = j.files[0].id; return driveFolderId; }
+      return driveFetch(DRIVE_API + '?fields=id', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: DRIVE_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' })
+      }).then(function(res){ return res.json(); })
+        .then(function(j2){ driveFolderId = j2.id; return driveFolderId; });
+    });
 }
 
 function uploadToDrive(folderId, fname, content, existingId){
-  var boundary = 'supguard_boundary_' + Date.now();
+  var boundary = 'supguard_' + Date.now();
   var metadata = existingId ? { name: fname } : { name: fname, parents: [folderId], mimeType: 'application/json' };
   var body =
-    '--'+boundary+'\r\n'+
-    'Content-Type: application/json; charset=UTF-8\r\n\r\n'+
-    JSON.stringify(metadata) + '\r\n'+
-    '--'+boundary+'\r\n'+
-    'Content-Type: application/json\r\n\r\n'+
-    content + '\r\n'+
-    '--'+boundary+'--';
+    '--' + boundary + '\r\n' +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify(metadata) + '\r\n' +
+    '--' + boundary + '\r\n' +
+    'Content-Type: application/json\r\n\r\n' +
+    content + '\r\n' +
+    '--' + boundary + '--';
   var url = existingId
-    ? 'https://www.googleapis.com/upload/drive/v3/files/'+existingId+'?uploadType=multipart'
-    : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-  return fetch(url, {
+    ? DRIVE_UPLOAD + '/' + existingId + '?uploadType=multipart&fields=id'
+    : DRIVE_UPLOAD + '?uploadType=multipart&fields=id';
+  return driveFetch(url, {
     method: existingId ? 'PATCH' : 'POST',
-    headers: { 'Authorization':'Bearer '+accessToken, 'Content-Type':'multipart/related; boundary='+boundary },
+    headers: { 'Content-Type': 'multipart/related; boundary=' + boundary },
     body: body
-  }).then(function(res){
-    if(!res.ok) throw new Error('Drive upload failed: '+res.status);
-    return res.json();
-  });
+  }).then(function(res){ return res.json(); });
 }
 
 function saveToDrive(){
-  ensureAuth(function(){
-    toast('Saving to Drive…');
-    findOrCreateFolder().then(function(folderId){
-      var fname = fileNameFor() + '.supguard';
-      var content = JSON.stringify(gatherReport());
-      var qName = fname.replace(/'/g, "\\'");
-      return gapi.client.drive.files.list({ q: "name='"+qName+"' and '"+folderId+"' in parents and trashed=false", fields:'files(id)' })
-        .then(function(listRes){
-          var existingId = (listRes.result.files && listRes.result.files[0]) ? listRes.result.files[0].id : null;
-          return uploadToDrive(folderId, fname, content, existingId);
-        });
-    }).then(function(){
-      toast('Saved to Drive ✓');
-    }).catch(function(e){
-      console.error(e); toast('Drive save failed');
-    });
+  toast('Connecting to Google Drive…');
+  var fname = fileNameFor() + '.supguard';
+  findOrCreateFolder().then(function(folderId){
+    var q = "name='" + fname.replace(/'/g, "\\'") + "' and '" + folderId + "' in parents and trashed=false";
+    return driveFetch(DRIVE_API + '?q=' + encodeURIComponent(q) + '&fields=' + encodeURIComponent('files(id)'))
+      .then(function(res){ return res.json(); })
+      .then(function(j){
+        var existingId = (j.files && j.files[0]) ? j.files[0].id : null;
+        return uploadToDrive(folderId, fname, JSON.stringify(gatherReport()), existingId);
+      });
+  }).then(function(){
+    toast('Saved to Drive ✓');
+  }).catch(function(e){
+    driveError(e.message || String(e));
   });
 }
 
 function loadFromDrive(){
-  ensureAuth(function(){
-    openModal('driveModal');
-    $('driveFileList').innerHTML = '<p class="hint">Loading…</p>';
-    findOrCreateFolder().then(function(folderId){
-      return gapi.client.drive.files.list({ q: "'"+folderId+"' in parents and trashed=false", orderBy:'modifiedTime desc', fields:'files(id,name,modifiedTime)' });
-    }).then(function(res){
-      var files = res.result.files || [];
-      var list = $('driveFileList');
-      if(!files.length){ list.innerHTML = '<p class="hint">No saved reports found in Drive.</p>'; return; }
-      list.innerHTML = '';
-      files.forEach(function(f){
-        var div = document.createElement('div');
-        div.className = 'drive-file-item';
-        div.innerHTML = '<div><strong>'+escapeHtml(f.name)+'</strong><br><span class="hint">'+new Date(f.modifiedTime).toLocaleString()+'</span></div><button class="btn small primary">Load</button>';
-        div.querySelector('button').addEventListener('click', function(){
-          gapi.client.drive.files.get({ fileId: f.id, alt:'media' }).then(function(fileRes){
-            var data = fileRes.result;
-            if(typeof data === 'string'){ try{ data = JSON.parse(data); }catch(e){ data = JSON.parse(fileRes.body); } }
+  openModal('driveModal');
+  $('driveFileList').innerHTML = '<p class="hint">Connecting to Google Drive…</p>';
+  findOrCreateFolder().then(function(folderId){
+    return driveFetch(DRIVE_API + '?q=' + encodeURIComponent("'" + folderId + "' in parents and trashed=false") +
+      '&orderBy=modifiedTime%20desc&fields=' + encodeURIComponent('files(id,name,modifiedTime)'))
+      .then(function(res){ return res.json(); });
+  }).then(function(j){
+    var files = j.files || [];
+    var list = $('driveFileList');
+    if(!files.length){
+      list.innerHTML = '<p class="hint">No saved reports found in the "' + DRIVE_FOLDER_NAME + '" folder yet.</p>';
+      return;
+    }
+    list.innerHTML = '';
+    files.forEach(function(f){
+      var div = document.createElement('div');
+      div.className = 'drive-file-item';
+      div.innerHTML = '<div><strong>' + escapeHtml(f.name) + '</strong><br><span class="hint">' +
+        escapeHtml(new Date(f.modifiedTime).toLocaleString()) + '</span></div><button class="btn small primary">Load</button>';
+      div.querySelector('button').addEventListener('click', function(){
+        list.innerHTML = '<p class="hint">Loading report…</p>';
+        driveFetch(DRIVE_API + '/' + f.id + '?alt=media')
+          .then(function(res){ return res.json(); })
+          .then(function(data){
             applyReport(data);
             closeModal('driveModal');
             toast('Report loaded ✓');
-          }).catch(function(e){ console.error(e); toast('Failed to load file'); });
-        });
-        list.appendChild(div);
+          })
+          .catch(function(e){ driveError('Could not open that file — ' + (e.message || e)); });
       });
-    }).catch(function(e){
-      console.error(e); toast('Drive load failed'); closeModal('driveModal');
+      list.appendChild(div);
     });
+  }).catch(function(e){
+    driveError(e.message || String(e));
   });
 }
-
 /* ---------------- Print / PDF ---------------- */
 function buildPrintView(){
   var s = loadSettings();
@@ -1329,6 +1453,20 @@ function wireEvents(){
     if(el) el.addEventListener('input', function(){ saveSettings(true); });
   });
 
+  $('btnDriveRetry').addEventListener('click', function(){
+    if(gisInited){ toast('Google sign-in is already connected ✓'); return; }
+    // Re-inject the script; the original may have failed on a dead connection.
+    gisFailed = null;
+    updateDriveStatus();
+    toast('Retrying Google connection…');
+    var s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true; s.defer = true;
+    s.onload = function(){ window.gisLoaded(); };
+    s.onerror = function(){ window.gisLoadFailed(); };
+    document.body.appendChild(s);
+  });
+
   $('btnPickLogo').addEventListener('click', function(){ $('setCompanyLogoFile').click(); });
   $('btnRemoveLogo').addEventListener('click', function(){
     pendingLogoDataUrl = '';
@@ -1396,6 +1534,9 @@ function init(){
   initTabs();
   wireEvents();
   populateSettingsTab();
+  updateDriveStatus();
+  var verEl = $('appVersion');
+  if(verEl) verEl.textContent = 'SupGuard Pro — build ' + APP_VERSION;
   var s = loadSettings();
   if(s.inspectorName) setVal('inspectorSigName', s.inspectorName);
   setVal('inspectionDate', todayStr());
@@ -1413,9 +1554,12 @@ document.addEventListener('DOMContentLoaded', init);
 
 </script>
 
-<!-- Google APIs — loaded at end of body per architecture spec, never in <head> -->
-<script src="https://apis.google.com/js/api.js" onload="gapiLoaded()" async defer></script>
-<script src="https://accounts.google.com/gsi/client" onload="gisLoaded()" async defer></script>
+<!-- Google Identity Services only. The Drive REST API is called directly with
+     the bearer token, so gapi + the API key are no longer needed. onerror is
+     what turns a blocked/failed download into a visible message instead of a
+     permanent "still loading" state. Loaded at end of body, never in <head>. -->
+<script src="https://accounts.google.com/gsi/client"
+        onload="gisLoaded()" onerror="gisLoadFailed()" async defer></script>
 
 </body>
 </html>
