@@ -1,5 +1,5 @@
 // SupGuard Pro service worker
-const SW_VERSION = 'v1';
+const SW_VERSION = 'v2';
 const CACHE_NAME = 'supguard-pro-' + SW_VERSION;
 
 const APP_SHELL = [
