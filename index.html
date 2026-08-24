@@ -509,6 +509,14 @@ function val(id){ var el=$(id); return el ? el.value : ''; }
 function setVal(id,v){ var el=$(id); if(el) el.value = v||''; }
 function escapeHtml(s){ return (s==null?'':String(s)).replace(/[&<>"']/g, function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];}); }
 function uid(prefix){ return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,7); }
+
+/* Escapes each part individually, drops blanks, then joins with a separator.
+   Escaping AFTER joining would mangle HTML entities in the separator. */
+function joinParts(parts, sep){
+  return parts.filter(function(p){ return p !== null && p !== undefined && String(p).trim() !== ''; })
+              .map(escapeHtml)
+              .join(sep || ' &nbsp;&bull;&nbsp; ');
+}
 function todayStr(){ var d=new Date(); return d.toISOString().slice(0,10); }
 
 var toastTimer=null;
@@ -1175,18 +1183,23 @@ function loadFromDrive(){
 function buildPrintView(){
   var s = loadSettings();
   var logoHtml = s.companyLogo ? '<img class="print-logo" src="'+s.companyLogo+'">' : '';
-  var companyLine = [
+  // Escape each PART, then join with the separator. Escaping the whole joined
+  // string would turn the separator entities into literal text.
+  var companyLine = joinParts([
     s.companyName,
     [s.companyStreet, s.companyCity, s.companyState, s.companyZip].filter(Boolean).join(', '),
     s.companyPhone,
     s.companyEmail,
     s.companyLicense ? 'Lic. ' + s.companyLicense : ''
-  ].filter(Boolean).join(' &nbsp;|&nbsp; ');
-  var inspectorLine = [
+  ]);
+  var inspectorLine = joinParts([
     s.inspectorName,
     s.inspectorCert,
     s.inspectorLicense ? 'Lic. ' + s.inspectorLicense : ''
-  ].filter(Boolean).join(' — ');
+  ]);
+
+  // Page subtitle: omit the dash entirely when the facility name is blank.
+  var pageSub = joinParts([val('facilityName'), val('inspectionDate')], ' &mdash; ');
 
   var counts = { pass:0, fail:0, def:0, na:0 };
   state.checklist.forEach(function(sec){ sec.items.forEach(function(i){ counts[i.status]=(counts[i.status]||0)+1; }); });
@@ -1196,17 +1209,17 @@ function buildPrintView(){
   // PAGE 1 — Cover
   var p1 = '<div class="print-page">'+logoHtml+
     '<div class="print-h"><h1>Clean Agent Suppression System Inspection Report</h1>'+
-    '<div class="sub">'+escapeHtml(companyLine)+'</div></div>'+
+    '<div class="sub">'+companyLine+'</div></div>'+
     '<div class="p-section-title">Facility</div>'+
     '<div class="p-grid2">'+
       '<div><b>Facility:</b> '+escapeHtml(val('facilityName'))+'</div>'+
       '<div><b>Report #:</b> '+escapeHtml(val('reportNumber'))+'</div>'+
-      '<div><b>Address:</b> '+escapeHtml(val('facilityAddress')+', '+val('facilityCity')+', '+val('facilityState')+' '+val('facilityZip'))+'</div>'+
+      '<div><b>Address:</b> '+(joinParts([val('facilityAddress'), val('facilityCity'), [val('facilityState'), val('facilityZip')].filter(Boolean).join(' ')], ', ') || '&mdash;')+'</div>'+
       '<div><b>Inspection Date:</b> '+escapeHtml(val('inspectionDate'))+' '+escapeHtml(val('inspectionTime'))+'</div>'+
-      '<div><b>Contact:</b> '+escapeHtml(val('contactName'))+' — '+escapeHtml(val('contactPhone'))+'</div>'+
+      '<div><b>Contact:</b> '+(joinParts([val('contactName'), val('contactPhone')]) || '&mdash;')+'</div>'+
       '<div><b>Inspection Type:</b> '+escapeHtml(val('inspectionType'))+'</div>'+
       '<div><b>Occupancy:</b> '+escapeHtml(val('occupancyType'))+'</div>'+
-      '<div><b>AHJ:</b> '+escapeHtml(val('ahjName'))+' — '+escapeHtml(val('ahjPhone'))+'</div>'+
+      '<div><b>AHJ:</b> '+(joinParts([val('ahjName'), val('ahjPhone')]) || '&mdash;')+'</div>'+
       '<div><b>Permit #:</b> '+escapeHtml(val('permitNumber'))+'</div>'+
       '<div><b>Permit Exp:</b> '+escapeHtml(val('permitExpiration'))+'</div>'+
     '</div>'+
@@ -1223,7 +1236,7 @@ function buildPrintView(){
     '<div class="p-grid2"><div><b>Pass:</b> '+counts.pass+'</div><div><b>Fail:</b> '+counts.fail+'</div>'+
     '<div><b>Deficiency:</b> '+counts.def+'</div><div><b>N/A:</b> '+counts.na+'</div></div>'+
     '<div class="p-section-title">Inspected By</div>'+
-    '<div style="font-size:11px;">'+escapeHtml(inspectorLine || '—')+'</div>'+
+    '<div style="font-size:11px;">'+(inspectorLine || '&mdash;')+'</div>'+
   '</div>';
   pages.push(p1);
 
@@ -1234,7 +1247,7 @@ function buildPrintView(){
       '<td>'+escapeHtml(c.hydroDate)+'</td><td>'+escapeHtml(due||'')+'</td><td>'+escapeHtml(c.fillWeight)+'</td><td>'+escapeHtml(STATUS_LABELS[c.status]||c.status)+'</td></tr>';
   }).join('');
   var p2 = '<div class="print-page">'+logoHtml+
-    '<div class="print-h"><h1>Cylinder Inventory</h1><div class="sub">'+escapeHtml(val('facilityName'))+' — '+escapeHtml(val('inspectionDate'))+'</div></div>'+
+    '<div class="print-h"><h1>Cylinder Inventory</h1><div class="sub">'+pageSub+'</div></div>'+
     '<table class="p-table"><thead><tr><th>Cyl ID</th><th>Agent</th><th>Serial</th><th>Last Hydro</th><th>Hydro Due</th><th>Fill Wt/Press</th><th>Status</th></tr></thead>'+
     '<tbody>'+(cylRows || '<tr><td colspan="7">No cylinders recorded.</td></tr>')+'</tbody></table>'+
   '</div>';
@@ -1248,7 +1261,7 @@ function buildPrintView(){
     return '<div class="p-section-title">'+escapeHtml(sec.name)+'</div><table class="p-table"><tbody>'+rows+'</tbody></table>';
   }).join('');
   var p3 = '<div class="print-page">'+logoHtml+
-    '<div class="print-h"><h1>NFPA 2001 Inspection Checklist</h1><div class="sub">'+escapeHtml(val('facilityName'))+' — '+escapeHtml(val('inspectionDate'))+'</div></div>'+
+    '<div class="print-h"><h1>NFPA 2001 Inspection Checklist</h1><div class="sub">'+pageSub+'</div></div>'+
     checklistHtml +
   '</div>';
   pages.push(p3);
@@ -1260,7 +1273,7 @@ function buildPrintView(){
   var allDefs = autoList.map(escapeHtml).concat(manualList);
   if(allDefs.length){
     var p4 = '<div class="print-page">'+logoHtml+
-      '<div class="print-h"><h1>Deficiencies</h1><div class="sub">'+escapeHtml(val('facilityName'))+' — '+escapeHtml(val('inspectionDate'))+'</div></div>'+
+      '<div class="print-h"><h1>Deficiencies</h1><div class="sub">'+pageSub+'</div></div>'+
       '<ol>'+allDefs.map(function(d){ return '<li style="margin-bottom:8px;font-size:12px;">'+d+'</li>'; }).join('')+'</ol>'+
     '</div>';
     pages.push(p4);
@@ -1272,7 +1285,7 @@ function buildPrintView(){
       return '<div class="p-photo"><img src="'+p.dataUrl+'"><div style="font-size:11px;">'+escapeHtml(p.caption||'')+'</div></div>';
     }).join('');
     var p5 = '<div class="print-page">'+logoHtml+
-      '<div class="print-h"><h1>Photos</h1><div class="sub">'+escapeHtml(val('facilityName'))+' — '+escapeHtml(val('inspectionDate'))+'</div></div>'+
+      '<div class="print-h"><h1>Photos</h1><div class="sub">'+pageSub+'</div></div>'+
       photosHtml +
     '</div>';
     pages.push(p5);
@@ -1280,7 +1293,7 @@ function buildPrintView(){
 
   // PAGE 6 — Signatures
   var p6 = '<div class="print-page">'+logoHtml+
-    '<div class="print-h"><h1>Signatures</h1><div class="sub">'+escapeHtml(val('facilityName'))+' — '+escapeHtml(val('inspectionDate'))+'</div></div>'+
+    '<div class="print-h"><h1>Signatures</h1><div class="sub">'+pageSub+'</div></div>'+
     '<div class="p-section-title">Customer Acknowledgement</div>'+
     '<div>Name: '+escapeHtml(val('customerSigName'))+' &nbsp;&nbsp; Date: '+escapeHtml(val('customerSigDate'))+'</div>'+
     '<div class="p-sig-box">'+(state.sig.customer ? '<img src="'+state.sig.customer+'">' : '<span style="color:#999;">No signature captured</span>')+'</div>'+
